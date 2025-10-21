@@ -181,11 +181,13 @@
         }
 
         class Projectile { 
-            constructor(x, y, radius, color, velocity, maxLife = 120) {
+            constructor(x, y, radius, color, velocity, maxLife = 120, penetration) {
                 this.x = x; this.y = y; this.radius = radius;
                 this.color = color; this.velocity = velocity;
                 this.life = 0;
                 this.maxLife = maxLife;
+                this.penetration = penetration; // Can be undefined for non-player projectiles
+                this.hitEnemies = new Set(); // Keep track of enemies already hit by this projectile
             }
             draw() {
                 ctx.beginPath();
@@ -294,7 +296,7 @@
                 this.maxLife = 1800; // 30 seconds at 60fps
                 this.life = this.maxLife;
                 this.range = 300;
-                this.shootRate = 1000; // Shoots every 1 second
+                this.shootRate = 500; // Shoots every 0.5 seconds
                 this.shootIntervalId = setInterval(() => this.shoot(), this.shootRate);
             }
 
@@ -356,7 +358,8 @@
             unlimitedAmmo: { name: "無限子彈", description: "子彈如暴雨般傾瀉而出！" },
             increaseMaxHealth: { name: "增加生命上限", description: "最大生命值提升 25 點並回復生命" },
             autoTurret: { name: "自動砲台", description: "每5秒安裝一座砲台，持續30秒。" },
-            increaseProjectileRange: { name: "增加射程", description: "子彈飛行距離提升 25%。" }
+            increaseProjectileRange: { name: "增加射程", description: "子彈飛行距離提升 25%。" },
+            bulletPenetration: { name: "子彈穿透", description: "子彈可以穿透一個額外的敵人。" }
         };
 
         function init(savedState = null) {
@@ -400,7 +403,8 @@
                 playerSkills = {
                     fireRate: 500,
                     projectiles: 1,
-                    projectileRange: 60, 
+                    projectileRange: 60,
+                    penetration: 0
                 };
             }
             
@@ -500,7 +504,7 @@
                 for (let i = 0; i < playerSkills.projectiles; i++) {
                     const angle = mainAngle + (i - (playerSkills.projectiles - 1) / 2) * spread;
                     const velocity = { x: Math.cos(angle) * 6, y: Math.sin(angle) * 6 };
-                    projectiles.push(new Projectile(player.x, player.y, 5, 'white', velocity, playerSkills.projectileRange));
+                    projectiles.push(new Projectile(player.x, player.y, 5, 'white', velocity, playerSkills.projectileRange, playerSkills.penetration));
                 }
              }
         }
@@ -573,6 +577,9 @@
                 case 'increaseProjectileRange':
                     playerSkills.projectileRange = (playerSkills.projectileRange || 60) * 1.25;
                     break;
+                case 'bulletPenetration':
+                    playerSkills.penetration = (playerSkills.penetration || 0) + 1;
+                    break;
             }
             levelUpScreen.classList.add('hidden');
             levelUpScreen.classList.remove('flex');
@@ -604,15 +611,22 @@
         }
 
         function handleCollisions() {
-            experienceOrbs.forEach((orb, index) => {
+            // Orb collision first
+            for (let i = experienceOrbs.length - 1; i >= 0; i--) {
+                const orb = experienceOrbs[i];
                 const dist = Math.hypot(player.x - orb.x, player.y - orb.y);
                 if (dist - orb.radius - player.radius < 1) {
                     player.gainXP(orb.xpValue);
-                    experienceOrbs.splice(index, 1);
+                    experienceOrbs.splice(i, 1);
                 }
-            });
+            }
 
-            enemies.forEach((enemy, eIndex) => {
+            // Use reverse loops to safely splice while iterating
+            for (let eIndex = enemies.length - 1; eIndex >= 0; eIndex--) {
+                const enemy = enemies[eIndex];
+                let enemyIsDead = false;
+
+                // Player-Enemy Collision
                 const playerDist = Math.hypot(player.x - enemy.x, player.y - enemy.y);
                 if (playerDist - enemy.radius - player.radius < 1) {
                     player.health -= 10;
@@ -620,14 +634,25 @@
                     updateUI();
                     enemies.splice(eIndex, 1);
                     if (player.health <= 0) endGame();
-                    return;
+                    continue; // Enemy is gone, move to the next one in the loop
                 }
 
-                projectiles.forEach((projectile, pIndex) => {
+                // Projectile-Enemy Collision
+                for (let pIndex = projectiles.length - 1; pIndex >= 0; pIndex--) {
+                    const projectile = projectiles[pIndex];
+
+                    if (projectile.hitEnemies.has(enemy)) continue;
+
                     const projDist = Math.hypot(projectile.x - enemy.x, projectile.y - enemy.y);
                     if (projDist - enemy.radius - projectile.radius < 1) {
+                        projectile.hitEnemies.add(enemy);
                         enemy.health -= 1;
-                        projectiles.splice(pIndex, 1);
+
+                        if (projectile.penetration !== undefined && projectile.penetration > 0) {
+                            projectile.penetration--;
+                        } else {
+                            projectiles.splice(pIndex, 1);
+                        }
 
                         if (enemy.health <= 0) {
                             const isBoss = enemy instanceof Boss;
@@ -635,37 +660,40 @@
                             const xpValue = isBoss ? 500 : 20;
                             const orbColor = isBoss ? 'gold' : 'cyan';
                             const orbRadius = isBoss ? 15 : 5;
-
                             updateUI();
                             experienceOrbs.push(new ExperienceOrb(enemy.x, enemy.y, orbRadius, orbColor, xpValue));
                             enemies.splice(eIndex, 1);
+                            enemyIsDead = true;
+                            break; // Enemy is dead, no need to check other projectiles
                         }
-                        return;
                     }
-                });
+                }
 
+                if (enemyIsDead) continue;
+
+                // AOE-Enemy Collision
                 aoeAttacks.forEach(attack => {
                     if (attack.hitEnemies.has(enemy)) return;
                     const aoeDist = Math.hypot(attack.x - enemy.x, attack.y - enemy.y);
-                    if (aoeDist - enemy.radius - attack.radius < 1) {
+                    if (aoeDist - enemy.radius < attack.radius) {
                         attack.hitEnemies.add(enemy);
-                        enemy.health -= 1; 
+                        enemy.health -= 1;
 
                         if (enemy.health <= 0) {
-                            const isBoss = enemy instanceof Boss;
-                            score += isBoss ? 2000 : 50;
-                            const xpValue = isBoss ? 500 : 10;
-                            const orbColor = isBoss ? 'gold' : 'cyan';
-                            const orbRadius = isBoss ? 15 : 5;
-
-                            updateUI();
-                            experienceOrbs.push(new ExperienceOrb(enemy.x, enemy.y, orbRadius, orbColor, xpValue));
-                            enemies.splice(eIndex, 1);
+                             if (enemies[eIndex] === enemy) { // Check if enemy hasn't been removed by another AOE
+                                const isBoss = enemy instanceof Boss;
+                                score += isBoss ? 2000 : 50;
+                                const xpValue = isBoss ? 500 : 10;
+                                const orbColor = isBoss ? 'gold' : 'cyan';
+                                const orbRadius = isBoss ? 15 : 5;
+                                updateUI();
+                                experienceOrbs.push(new ExperienceOrb(enemy.x, enemy.y, orbRadius, orbColor, xpValue));
+                                enemies.splice(eIndex, 1);
+                            }
                         }
-                        return;
                     }
                 });
-            });
+            }
         }
         
         function startGame(savedState = null) {
@@ -744,6 +772,4 @@
     </script>
 </body>
 </html>
-
-
 
